@@ -2,12 +2,14 @@ import asyncio
 import json
 import os
 import time
-import pandas as pd
-import networkx as nx
-from openai import AsyncOpenAI
-from dotenv import load_dotenv
 
-# 1. API 키 설정 (.env 파일 또는 환경변수에서 로드)
+import networkx as nx
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
+from ucimlrepo import fetch_ucirepo
+
+
+# 1. API key
 load_dotenv()
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 
@@ -16,130 +18,301 @@ client = AsyncOpenAI(
     api_key=OPENROUTER_API_KEY,
 )
 
-# 2. 공개된 오픈 스마트홈 센서 데이터셋 URL 직접 로드
-# (GitHub에 공개된 Smart Home IoT / Climate Sensor Open Dataset)
-OPEN_DATASET_URL = "https://raw.githubusercontent.com/datasets/covid-19/main/data/countries-aggregated.csv"
-# 실제 실내 온/습도/CO2 오픈 데이터셋 샘플 URL (GitHub Raw Link)
-SMARTHOME_DATASET_URL = "https://raw.githubusercontent.com/jbrownlee/Datasets/master/daily-min-temperatures.csv"
 
-def fetch_open_multimodal_dataset(url: str, limit: int = 5) -> list[dict]:
-    """공개 URL에서 오픈 데이터셋을 직접 다운로드하여 JSON 리스트로 변환"""
-    print(f"[안내] 오픈 데이터셋 다운로드 중: {url}")
-    df = pd.read_csv(url)
+# 2. Dataset
+# UCI Room Occupancy Estimation (id=864)
+# Raw environmental sensors: temperature, light, sound, CO2, PIR, etc.
+# The occupancy target is intentionally NOT given to the LLM.
+DATASET_ID = 864
+NUM_WINDOWS = 5
+WINDOW_SIZE = 6
 
-    # 데이터셋의 상위 N개 샘플을 벤치마크용 dict 형태로 변환
-    samples = df.head(limit).to_dict(orient="records")
-    return samples
 
+def load_sensor_windows():
+    dataset = fetch_ucirepo(id=DATASET_ID)
+
+    # Only feature columns are used. The target (Room_Occupancy_Count) is excluded.
+    features = dataset.data.features.copy()
+
+    # Date/Time may be useful for ordering, but they are not sensor variables.
+    non_sensor_columns = {"Date", "Time"}
+    sensor_columns = [
+        column for column in features.columns
+        if column not in non_sensor_columns
+    ]
+
+    if len(features) < NUM_WINDOWS * WINDOW_SIZE:
+        raise ValueError("Dataset is too small for the requested windows.")
+
+    # Fixed, deterministic windows so both models receive exactly the same inputs.
+    max_start = len(features) - WINDOW_SIZE
+    starts = [
+        round(i * max_start / (NUM_WINDOWS - 1))
+        for i in range(NUM_WINDOWS)
+    ]
+
+    windows = []
+    for start in starts:
+        frame = features.iloc[start:start + WINDOW_SIZE]
+
+        # Convert through JSON so numpy/pandas scalar types become standard Python types.
+        records = json.loads(frame.to_json(orient="records"))
+
+        windows.append({
+            "start_index": int(start),
+            "sensor_columns": sensor_columns,
+            "observations": records,
+        })
+
+    return windows, sensor_columns
+
+
+# 3. Neutral prompt
+# No state names, actuator mappings, thresholds, or domain-specific answer examples are provided.
 SYSTEM_PROMPT = """
-당신은 스마트홈 제어 FSM(유한 상태 머신) 설계 전문가입니다.
-입력으로 주어지는 실내 환경 센서 데이터 및 상태를 분석하여 도메인 의미(예: Temp 상승 -> 냉방, 습도 상승 -> 제습, CO2 상승 -> 환기 등)를 유추하고 FSM 구조를 자율 설계하세요.
+You are given a short sequence of measurements from indoor environmental sensors.
 
-반드시 다른 설명 없이 오직 아래 구조의 Valid JSON 객체만 반환하세요:
+Infer a finite state machine (FSM) that summarizes meaningful operational modes
+and transitions supported by the provided measurements.
+
+Rules:
+1. Base the FSM only on the sensor fields and values present in the input.
+2. Do not assume sensors, actuator types, labels, states, or external variables
+   that are not present in the input.
+3. Choose state names independently from the observed data. No state names are predefined.
+4. Every transition condition must reference one or more sensor field names
+   that appear in the input.
+5. Transition conditions should use explicit numeric or boolean comparisons.
+6. Return only valid JSON. Do not include markdown or explanatory text.
+
+Required JSON structure:
 {
-  "states": ["IDLE", "COOLING", "VENTILATING", "DEHUMIDIFYING", "ERROR_FALLBACK"],
-  "initial_state": "IDLE",
+  "states": ["..."],
+  "initial_state": "...",
   "transitions": [
-    {"from": "IDLE", "to": "COOLING", "condition": "temp > 28"},
-    {"from": "IDLE", "to": "VENTILATING", "condition": "co2 > 1000"},
-    {"from": "COOLING", "to": "IDLE", "condition": "temp <= 25"},
-    {"from": "IDLE", "to": "ERROR_FALLBACK", "condition": "sensor_error"}
+    {
+      "from": "...",
+      "to": "...",
+      "condition": "..."
+    }
   ]
 }
-"""
+""".strip()
 
-# 3. FSM 정적 품질 검증기 (100점 만점)
-def evaluate_fsm_static(json_text: str) -> tuple[int, dict]:
+
+# 4. Model-independent static evaluator
+# This evaluator checks structure and grounding only.
+# It does NOT reward particular state names such as COOLING, HEATING, etc.
+def evaluate_fsm_static(json_text: str, sensor_columns: list[str]) -> tuple[int, dict]:
     scores = {
-        "json_syntax": 0,
-        "domain_inference": 0,
-        "safety_fallback": 0,
-        "graph_integrity": 0
+        "schema_validity": 0,
+        "transition_integrity": 0,
+        "sensor_grounding": 0,
+        "graph_integrity": 0,
     }
 
     try:
         data = json.loads(json_text)
-        if "states" in data and "transitions" in data and "initial_state" in data:
-            scores["json_syntax"] = 25
-        else:
-            return sum(scores.values()), scores
     except Exception:
         return 0, scores
 
-    states = [str(s).upper() for s in data.get("states", [])]
-    transitions = data.get("transitions", [])
+    states = data.get("states")
+    initial_state = data.get("initial_state")
+    transitions = data.get("transitions")
 
-    # 도메인 제어 상태 유추 검사
-    if any(keyword in str(states) for keyword in ["COOL", "HEAT", "VENT", "DRY", "AIR", "DEHUMID"]):
-        scores["domain_inference"] = 25
+    # 1) Basic JSON/schema validity
+    if (
+        isinstance(states, list)
+        and len(states) >= 2
+        and isinstance(initial_state, str)
+        and isinstance(transitions, list)
+        and len(transitions) >= 1
+    ):
+        scores["schema_validity"] = 25
+    else:
+        return sum(scores.values()), scores
 
-    # Safety/Fallback 검사
-    if any("ERR" in s or "FALLBACK" in s or "FAIL" in s for s in states):
-        scores["safety_fallback"] = 25
+    state_set = set(str(state) for state in states)
 
-    # Graph 무결성 검사 (Deadlock 유무)
+    # 2) Transition integrity
+    transition_ok = True
+    for transition in transitions:
+        if not isinstance(transition, dict):
+            transition_ok = False
+            break
+
+        source = str(transition.get("from", ""))
+        target = str(transition.get("to", ""))
+        condition = transition.get("condition")
+
+        if (
+            source not in state_set
+            or target not in state_set
+            or not isinstance(condition, str)
+            or condition.strip() == ""
+        ):
+            transition_ok = False
+            break
+
+    if initial_state in state_set and transition_ok:
+        scores["transition_integrity"] = 25
+
+    # 3) Sensor grounding
+    # Every transition should be supported by at least one real input sensor field.
+    normalized_columns = [column.lower() for column in sensor_columns]
+    grounded_count = 0
+
+    for transition in transitions:
+        condition = str(transition.get("condition", "")).lower()
+
+        if any(column in condition for column in normalized_columns):
+            grounded_count += 1
+
+    if transitions:
+        grounding_ratio = grounded_count / len(transitions)
+
+        if grounding_ratio == 1.0:
+            scores["sensor_grounding"] = 25
+        elif grounding_ratio >= 0.75:
+            scores["sensor_grounding"] = 20
+        elif grounding_ratio >= 0.5:
+            scores["sensor_grounding"] = 15
+        elif grounding_ratio > 0:
+            scores["sensor_grounding"] = 5
+
+    # 4) Graph integrity
     try:
-        G = nx.DiGraph()
-        for s in data["states"]:
-            G.add_node(s)
-        for t in transitions:
-            G.add_edge(t["from"], t["to"])
+        graph = nx.DiGraph()
+        graph.add_nodes_from(states)
 
-        isolated = list(nx.isolates(G))
-        if len(isolated) == 0 and len(G.nodes) >= 3:
+        for transition in transitions:
+            graph.add_edge(transition["from"], transition["to"])
+
+        reachable = {initial_state} | nx.descendants(graph, initial_state)
+
+        if (
+            len(list(nx.isolates(graph))) == 0
+            and reachable == state_set
+        ):
             scores["graph_integrity"] = 25
     except Exception:
         pass
 
     return sum(scores.values()), scores
 
-# 4. 벤치마크 실행 함수
-async def run_open_dataset_benchmark(model_name: str, dataset: list[dict]):
-    print(f"\n==========================================")
-    print(f"[오픈 데이터셋 벤치마크] 모델: {model_name}")
-    print(f"==========================================")
 
-    for idx, sample in enumerate(dataset, 1):
+def clean_model_output(raw_content: str) -> str:
+    raw_content = raw_content.strip()
+
+    if raw_content.startswith("```"):
+        lines = raw_content.splitlines()
+
+        if len(lines) >= 2 and lines[-1].strip().startswith("```"):
+            raw_content = "\n".join(lines[1:-1])
+        else:
+            raw_content = "\n".join(lines[1:])
+
+    return raw_content.strip()
+
+
+# 5. Benchmark
+async def run_framework(model_name: str, windows: list[dict], sensor_columns: list[str]):
+    print("\n==========================================")
+    print(f"[Sensor-to-FSM] model: {model_name}")
+    print("==========================================")
+
+    results = []
+
+    for index, window in enumerate(windows, 1):
+        user_payload = {
+            "sensor_fields": sensor_columns,
+            "observations": window["observations"],
+        }
+
         start_time = time.time()
+
         try:
             response = await client.chat.completions.create(
                 model=model_name,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": f"오픈 데이터셋 샘플 #{idx}: {json.dumps(sample, ensure_ascii=False)}"}
+                    {
+                        "role": "user",
+                        "content": json.dumps(user_payload, ensure_ascii=False),
+                    },
                 ],
-                temperature=0.1
+                temperature=0.0,
             )
+
             latency_ms = round((time.time() - start_time) * 1000, 2)
-            raw_content = response.choices[0].message.content.strip()
+            raw_content = response.choices[0].message.content
+            cleaned_content = clean_model_output(raw_content)
 
-            if raw_content.startswith("```"):
-                lines = raw_content.splitlines()
-                raw_content = "\n".join(lines[1:-1]) if lines[-1].startswith("```") else "\n".join(lines[1:])
+            total_score, breakdown = evaluate_fsm_static(
+                cleaned_content,
+                sensor_columns,
+            )
 
-            total_score, breakdown = evaluate_fsm_static(raw_content)
+            result = {
+                "sample": index,
+                "latency_ms": latency_ms,
+                "score": total_score,
+                "breakdown": breakdown,
+                "fsm": cleaned_content,
+            }
+            results.append(result)
 
-            print(f"[샘플 #{idx}] Latency: {latency_ms} ms | FSM 점수: {total_score}/100")
-            print(f" - 세부 항목: {breakdown}")
-            print(f"--- [생성된 FSM JSON 전체] ---")
-            print(raw_content)
-            print(f"-----------------------------------\n")
+            print(
+                f"[window #{index}] "
+                f"Latency: {latency_ms} ms | "
+                f"Static score: {total_score}/100"
+            )
+            print(f" - breakdown: {breakdown}")
+            print("--- generated FSM ---")
+            print(cleaned_content)
+            print("---------------------\n")
 
-        except Exception as e:
-            print(f"[샘플 #{idx}] 오류 발생: {e}")
+        except Exception as error:
+            print(f"[window #{index}] error: {error}")
+
+    return results
+
+
+def print_summary(model_name: str, results: list[dict]):
+    if not results:
+        print(f"[summary] {model_name}: no successful results")
+        return
+
+    average_score = sum(result["score"] for result in results) / len(results)
+    average_latency = sum(result["latency_ms"] for result in results) / len(results)
+
+    print(
+        f"[summary] {model_name} | "
+        f"avg score: {average_score:.1f}/100 | "
+        f"avg latency: {average_latency:.2f} ms"
+    )
+
 
 async def main():
-    # 1. 오픈 데이터셋 온라인 로드 (상위 5개 샘플 추출)
-    dataset = fetch_open_multimodal_dataset(SMARTHOME_DATASET_URL, limit=5)
+    windows, sensor_columns = load_sensor_windows()
 
-    # 2. OpenRouter 모델 벤치마크 수행
+    print("[dataset] UCI Room Occupancy Estimation")
+    print(f"[sensor fields] {sensor_columns}")
+    print(f"[windows] {NUM_WINDOWS} x {WINDOW_SIZE} observations")
+
     models = [
         "openai/gpt-5.2",
-        "anthropic/claude-sonnet-4.6"
+        "anthropic/claude-sonnet-4.6",
     ]
 
-    for model in models:
-        await run_open_dataset_benchmark(model, dataset)
+    for model_name in models:
+        results = await run_framework(
+            model_name,
+            windows,
+            sensor_columns,
+        )
+        print_summary(model_name, results)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
